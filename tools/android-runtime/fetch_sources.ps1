@@ -25,6 +25,10 @@ $items = @(
     @{
         Name = "talloc-2.4.3"
         Url = "https://www.samba.org/ftp/talloc/talloc-2.4.3.tar.gz"
+        # samba.org answers 503/504 under load and publishes no CDN mirror for
+        # the upstream tarballs, so retries against the same host are the only
+        # recovery path. The SHA256 check below still rejects any corrupted
+        # partial download, and the retry loop backs off (10s..50s).
         Archive = "talloc-2.4.3.tar.gz"
         Sha256 = "DC46C40B9F46BB34DD97FE41F548B0E8B247B77A918576733C528E83ABD854DD"
         Extracted = "talloc-2.4.3"
@@ -47,26 +51,48 @@ foreach ($item in $items) {
     $archivePath = Join-Path $downloadsDir $item.Archive
     Write-Host "Downloading $($item.Name)"
 
-    $maxAttempts = 5
-    $candidateUrls = @($item.Url) + @($item.MirrorUrls)
+    # A cached, checksum-verified archive lets CI skip fragile origins such as
+    # samba.org entirely on warm runs.
+    if (Test-Path -LiteralPath $archivePath) {
+        $cachedSha256 = (Get-FileHash -Algorithm SHA256 -Path $archivePath).Hash.ToUpperInvariant()
+        if ($cachedSha256 -eq $item.Sha256) {
+            Write-Host "Using cached $($item.Archive) (SHA256 verified)"
+            $extractPathCached = Join-Path $sourcesDir $item.Extracted
+            if (-not (Test-Path -LiteralPath $extractPathCached)) {
+                tar -xf $archivePath -C $sourcesDir
+            }
+            continue
+        }
+        Write-Warning "Cached $($item.Archive) failed SHA256 verification; re-downloading"
+        Remove-Item -LiteralPath $archivePath -Force
+    }
+
+    $maxAttempts = 8
+    # @($item.MirrorUrls) yields a one-element array holding $null when the key
+    # is absent, which made the retry loop alternate between the real URL and an
+    # empty one ("Cannot validate argument on parameter 'Uri'"). Drop nulls and
+    # blanks so every attempt targets a real source.
+    $candidateUrls = @(@($item.Url) + @($item.MirrorUrls) | Where-Object { $_ -and "$_".Trim().Length -gt 0 })
     $downloaded = $false
     for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
         $url = $candidateUrls[($attempt - 1) % $candidateUrls.Count]
         try {
-            Write-Host "Downloading $($item.Name) from $url"
+            Write-Host "Downloading $($item.Name) from $url (attempt $attempt/$maxAttempts)"
             Invoke-WebRequest -Uri $url -OutFile $archivePath -TimeoutSec 600
             $downloaded = $true
             break
         } catch {
             Write-Warning "Attempt $attempt/$maxAttempts failed for $($item.Name) ($url): $($_.Exception.Message)"
             if ($attempt -lt $maxAttempts) {
-                Start-Sleep -Seconds (10 * $attempt)
-            } else {
-                throw
+                # Cap the backoff at 45s so eight attempts stay under ~5 minutes
+                # while still riding out a multi-minute samba.org outage.
+                Start-Sleep -Seconds ([Math]::Min(45, 10 * $attempt))
             }
         }
     }
-    if (-not $downloaded) { throw "Failed to download $($item.Name) after $maxAttempts attempts." }
+    if (-not $downloaded) {
+        throw "Failed to download $($item.Name) after $maxAttempts attempts from: $($candidateUrls -join ', ')"
+    }
 
     $actualSha256 = (Get-FileHash -Algorithm SHA256 -Path $archivePath).Hash.ToUpperInvariant()
     if ($actualSha256 -ne $item.Sha256) {

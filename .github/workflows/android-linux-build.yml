@@ -58,6 +58,18 @@ jobs:
             unzip \
             xz-utils
 
+      - name: Cache Android runtime sources
+        uses: actions/cache@v4
+        with:
+          # samba.org (talloc) answers 503/504 under load and has no upstream
+          # CDN mirror, so every cold run is a coin flip. Cache the verified
+          # source tarballs instead: once one run succeeds, later runs do not
+          # touch the fragile origins at all.
+          path: tools/android-runtime/downloads
+          key: ${{ runner.os }}-android-runtime-src-${{ hashFiles('tools/android-runtime/fetch_sources.ps1') }}
+          restore-keys: |
+            ${{ runner.os }}-android-runtime-src-
+
       - name: Fetch Android runtime sources
         shell: pwsh
         run: pwsh -NoProfile -File tools/android-runtime/fetch_sources.ps1
