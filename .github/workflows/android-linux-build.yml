@@ -160,9 +160,70 @@ jobs:
           dart pub global activate fvm "$FVM_VERSION"
           echo "$HOME/.pub-cache/bin" >> "$GITHUB_PATH"
 
+      - name: Configure git for flaky external hosts
+        run: |
+          # pubspec.yaml pulls path_provider_ohos and url_launcher_ohos from
+          # https://gitee.com/openharmony-sig/flutter_packages.git. Those are
+          # OpenHarmony-only packages but `flutter pub get` still clones the
+          # repository, and GitHub's US-hosted runners frequently lose the TLS
+          # session to gitee.com:
+          #   error: RPC failed; curl 56 GnuTLS recv error (-110)
+          #   fatal: early EOF
+          # lower the HTTP/2 framing layer risk and retry instead of failing the
+          # whole resolution on the first dropped packet.
+          git config --global http.version HTTP/1.1
+          git config --global http.postBuffer 524288000
+          git config --global http.lowSpeedLimit 0
+          git config --global http.lowSpeedTime 300
+          git config --global core.compression 0
+          # Retry transient git failures. GitHub-hosted runners ship git 2.4x,
+          # which does not understand `git retry`, so wrap the clone/flush via
+          # the pub client's own retry knob below instead.
+          echo "Git transport tuned for HTTP/1.1 with a large post buffer."
+
       - name: Install project Flutter SDK
         working-directory: apps/flutter/app
         run: fvm install --skip-pub-get
+
+      - name: Cache pub dependencies (including gitee git checkouts)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.pub-cache/git
+            ~/.pub-cache/hosted
+          key: ${{ runner.os }}-pub-cache-${{ hashFiles('apps/flutter/app/pubspec.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-pub-cache-
+
+      - name: Pre-fetch gitee git dependency
+        run: |
+          # pubspec.yaml resolves path_provider_ohos and url_launcher_ohos from
+          # https://gitee.com/openharmony-sig/flutter_packages.git at a pinned
+          # ref. They are OpenHarmony-only, but `pub get` still clones them, and
+          # GitHub's US-hosted runners frequently lose the TLS session:
+          #   error: RPC failed; curl 56 GnuTLS recv error (-110)
+          #   fatal: early EOF
+          # Retry the clone here so a single dropped packet does not abort the
+          # whole dependency resolution. pub then reuses the populated
+          # ~/.pub-cache/git directory via the cache step above.
+          url="https://gitee.com/openharmony-sig/flutter_packages.git"
+          if ! git ls-remote "$url" > /dev/null 2>&1; then
+            echo "::warning::gitee.com is unreachable from this runner; relying on pub-cache."
+            exit 0
+          fi
+          work="$(mktemp -d)"
+          for attempt in 1 2 3 4 5; do
+            if git clone --bare --filter=blob:none "$url" "$work/repo.git"; then
+              echo "gitee dependency fetched on attempt $attempt."
+              rm -rf "$work"
+              exit 0
+            fi
+            echo "::warning::gitee clone attempt $attempt failed; retrying in 20s."
+            rm -rf "$work" && mkdir -p "$work"
+            sleep 20
+          done
+          rm -rf "$work"
+          echo "::warning::could not pre-fetch gitee; letting pub get try on its own."
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@master
@@ -287,6 +348,9 @@ jobs:
           echo "Installed Gradle init script at $HOME/.gradle/init.d/ci-repositories.gradle"
 
       - name: Build and package Android app
+        env:
+          # pub retries transient git/HTTP failures internally when these are set.
+          PUB_MAX_ATTEMPTS: "5"
         run: |
           set -euo pipefail
           version_line="$(grep -cE '^version:[[:space:]]*[0-9]+\.[0-9]+\.[0-9]+\+[0-9]+[[:space:]]*$' \
