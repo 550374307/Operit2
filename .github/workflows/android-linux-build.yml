@@ -165,7 +165,15 @@ jobs:
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: "17"
+          # tools/android-shizuku/build.gradle.kts declares
+          #   sourceCompatibility = JavaVersion.VERSION_21
+          # so :embeddedShizuku:compileReleaseJavaWithJavac fails on JDK 17 with
+          #   error: invalid source release: 21
+          # The other Android modules still ask for 17; a JDK 21 toolchain
+          # compiles those fine because Gradle honours each module's own
+          # release setting. Upstream's Windows workflow pins 17 and never
+          # reaches this task.
+          java-version: "21"
 
       - name: Install FVM
         run: |
@@ -328,6 +336,22 @@ jobs:
         with:
           path: tools/release/work/android-v8
           key: ${{ runner.os }}-${{ runner.arch }}-android-v8-${{ hashFiles('tools/build_scripts/prepare_android_v8.py', 'apps/flutter/native/operit-flutter-bridge/Cargo.lock') }}
+
+      - name: Cache Rust and V8 build output
+        uses: actions/cache@v4
+        with:
+          # The APK job spent 2h20m, of which the Rust release build alone took
+          # 18m21s at `target/`. V8 is already cached via tools/release/work,
+          # but every rerun still rebuilt the Rust crates from scratch. Cache
+          # the Android cross-compile target dir so an iteration on an unrelated
+          # Java or Gradle error costs minutes, not hours.
+          path: |
+            apps/flutter/native/operit-flutter-bridge/target
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-android-${{ hashFiles('apps/flutter/native/operit-flutter-bridge/Cargo.lock', 'core/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-android-
 
       - name: Cache Gradle dependencies
         uses: actions/cache@v4
