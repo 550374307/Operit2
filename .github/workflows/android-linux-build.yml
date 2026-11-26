@@ -333,16 +333,6 @@ jobs:
                url : 'https://maven.aliyun.com/repository/public'],
           ]
 
-          def isThrottled = { repo ->
-              if (!(repo instanceof MavenArtifactRepository)) return false
-              def url = repo.url.toString()
-              THROTTLED_PREFIXES.any { url.contains(it) }
-          }
-          def isMirror = { repo ->
-              if (!(repo instanceof MavenArtifactRepository)) return false
-              repo.url.toString().contains('maven.aliyun.com')
-          }
-
           def route = { RepositoryHandler repositories ->
               // Repoint repositories that Gradle would otherwise send to a
               // throttled host. Adding new entries is fragile:
@@ -354,8 +344,7 @@ jobs:
               //
               // Instead: rewrite the URL in place, then drop any repository that
               // ends up duplicating an earlier URL, so each mirror is listed
-              // once and the repository count never grows. Safe to call from
-              // pluginManagement, buildscript and project scopes.
+              // once and the repository count never grows.
               repositories.withType(MavenArtifactRepository).configureEach { repo ->
                   def url = repo.url.toString()
                   if (!THROTTLED_PREFIXES.any { url.contains(it) }) return
@@ -370,12 +359,12 @@ jobs:
 
               def seen = [] as Set
               repositories.withType(MavenArtifactRepository).removeIf { repo ->
-                  def key = repo.url.toString()
-                  !seen.add(key)
+                  !seen.add(repo.url.toString())
               }
 
-              // Ensure both mirrors are present even when the project listed
-              // neither; this is the only case where anything is added.
+              // Both settings handlers list the mirrors already, but append them
+              // if a future edit drops one, so resolution never depends on the
+              // throttled hosts.
               MIRRORS.each { target ->
                   def present = repositories.withType(MavenArtifactRepository).any {
                       it.url.toString().startsWith(target.url)
@@ -390,13 +379,15 @@ jobs:
           }
 
           beforeSettings { settings ->
+              // The Flutter Gradle plugin enables FAIL_ON_PROJECT_REPOS, so
+              // dependency resolution goes through these settings-level handlers
+              // only. Touching project repositories is both pointless and
+              // rejected:
+              //   Build was configured to prefer settings repositories over
+              //   project repositories but repository 'ci-aliyun-gradle-plugin'
+              //   was added by settings file 'settings.gradle.kts'
               route(settings.pluginManagement.repositories)
               route(settings.dependencyResolutionManagement.repositories)
-          }
-
-          allprojects { project ->
-              route(project.buildscript.repositories)
-              route(project.repositories)
           }
 
           println "[ci] Maven Central and the Gradle Plugin Portal are served by ${MIRRORS}"
