@@ -327,8 +327,10 @@ jobs:
               'plugins.gradle.org',      // redirects into repo.maven.apache.org
           ]
           def MIRRORS = [
-              'https://maven.aliyun.com/repository/gradle-plugin',  // plugin markers
-              'https://maven.aliyun.com/repository/public',         // mirrors Maven Central
+              [name: 'ci-aliyun-gradle-plugin',
+               url : 'https://maven.aliyun.com/repository/gradle-plugin'],
+              [name: 'ci-aliyun-public',
+               url : 'https://maven.aliyun.com/repository/public'],
           ]
 
           def isThrottled = { repo ->
@@ -346,8 +348,17 @@ jobs:
               repositories.removeAll(removed)
               // Re-insert the mirrors at the front, in priority order, so Maven
               // Central artifacts resolve without touching a throttled host.
+              // `repositories.maven {}` defaults to the name "maven", so adding
+              // two of them throws 'Cannot add a repository with name maven as a
+              // repository with that name already exists'; name each one.
               MIRRORS.reverseEach { target ->
-                  repositories.addFirst(repositories.maven { url = target })
+                  if (!repositories.findByName(target.name)) {
+                      repositories.addFirst(
+                              repositories.maven {
+                                  name = target.name
+                                  url = target.url
+                              })
+                  }
               }
           }
 
