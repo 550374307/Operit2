@@ -85,7 +85,12 @@ def run(command, **kwargs):
 
 
 def output(command):
-    return run(command, capture_output=True, text=True).stdout.strip()
+    # Cargo emits UTF-8 even on Windows, where text=True defaults to the ANSI
+    # code page (cp1252). Decode explicitly and never let a stray byte turn the
+    # result into None, which later fails with an opaque AttributeError.
+    result = run(command, capture_output=True, text=True,
+                 encoding="utf-8", errors="replace")
+    return (result.stdout or "").strip()
 
 
 def api_level():
@@ -343,8 +348,9 @@ def brew_prefix(formula):
         (str(p) for p in (Path("/opt/homebrew/bin/brew"), Path("/usr/local/bin/brew")) if p.is_file()), None)
     if not brew:
         return None
-    result = subprocess.run([brew, "--prefix", formula], capture_output=True, text=True)
-    return Path(result.stdout.strip()) if result.returncode == 0 else None
+    result = subprocess.run([brew, "--prefix", formula], capture_output=True,
+                            text=True, encoding="utf-8", errors="replace")
+    return Path((result.stdout or "").strip()) if result.returncode == 0 else None
 
 
 def find_host_clang():
