@@ -304,54 +304,64 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-gradle-
 
-      - name: Balance Maven repositories on CI
+      - name: Route Maven resolution through the mirror on CI
         run: |
-          # apps/flutter/app/android/*.gradle.kts lists maven.aliyun.com mirrors
-          # ahead of google()/mavenCentral(). Two failure modes have been seen:
+          # repo.maven.apache.org answers 429 Too Many Requests for GitHub's
+          # shared runner IPs, and plugins.gradle.org redirects there:
           #
-          #   aliyun first  -> 502 Bad Gateway on kotlin-util-klib
-          #   upstream first -> 429 Too Many Requests on repo.maven.apache.org
+          #   Could not GET 'https://plugins.gradle.org/m2/.../kotlin-stdlib-2.0.21.pom'
+          #     > Could not GET 'https://repo.maven.apache.org/maven2/...' 429
           #
-          # Gradle treats 4xx/5xx on a repository as fatal for that module and
-          # does not fall through, so whichever host comes first decides the
-          # build. A CI-only init script interleaves the two sets instead: the
-          # canonical repositories are tried first, and the regional mirror is
-          # retained as the next entry so a throttled Maven Central still has a
-          # working fallback. Project build files stay untouched for local use.
+          # Ordering alone cannot fix this: Gradle aborts the module on a 4xx
+          # instead of falling through to the next repository, and the mirror
+          # that would have answered sits behind the entry that redirects to the
+          # throttled host. Drop the throttled repositories from the chain
+          # entirely and rely on maven.aliyun.com, whose "public" repository
+          # mirrors Maven Central, with dl.google.com kept for Google artifacts.
+          # This is a CI-only init script; project build files stay untouched.
           mkdir -p "$HOME/.gradle/init.d"
           cat > "$HOME/.gradle/init.d/ci-repositories.gradle" <<'GRADLE'
-          // Interleave: upstream first, mirror immediately after, so a 429 from
-          // Maven Central or a 502 from the mirror still leaves a working path.
-          def balance = { RepositoryHandler repositories ->
-              def isUpstream = { repo ->
-                  if (!(repo instanceof MavenArtifactRepository)) return false
-                  def url = repo.url.toString()
-                  url.contains('dl.google.com') ||
-                      url.contains('repo.maven.apache.org') ||
-                      url.contains('plugins.gradle.org') ||
-                      url.contains('jitpack.io')
-              }
-              def all = repositories.toList()
-              def upstream = all.findAll(isUpstream)
-              def mirrors = all.findAll { !isUpstream(it) }
-              if (upstream.isEmpty() || mirrors.isEmpty()) return
-              repositories.clear()
-              def max = Math.max(upstream.size(), mirrors.size())
-              for (int i = 0; i < max; i++) {
-                  if (i < upstream.size()) repositories.add(upstream[i])
-                  if (i < mirrors.size()) repositories.add(mirrors[i])
+          def THROTTLED_PREFIXES = [
+              'repo.maven.apache.org',   // serves 429 to shared runner IPs
+              'repo1.maven.org',         // alias of the same host
+              'plugins.gradle.org',      // redirects into repo.maven.apache.org
+          ]
+          def MIRRORS = [
+              'https://maven.aliyun.com/repository/gradle-plugin',  // plugin markers
+              'https://maven.aliyun.com/repository/public',         // mirrors Maven Central
+          ]
+
+          def isThrottled = { repo ->
+              if (!(repo instanceof MavenArtifactRepository)) return false
+              def url = repo.url.toString()
+              THROTTLED_PREFIXES.any { url.contains(it) }
+          }
+          def isMirror = { repo ->
+              if (!(repo instanceof MavenArtifactRepository)) return false
+              repo.url.toString().contains('maven.aliyun.com')
+          }
+
+          def route = { RepositoryHandler repositories ->
+              def removed = repositories.findAll { isThrottled(it) || isMirror(it) }
+              repositories.removeAll(removed)
+              // Re-insert the mirrors at the front, in priority order, so Maven
+              // Central artifacts resolve without touching a throttled host.
+              MIRRORS.reverseEach { target ->
+                  repositories.addFirst(repositories.maven { url = target })
               }
           }
 
           beforeSettings { settings ->
-              balance(settings.pluginManagement.repositories)
-              balance(settings.dependencyResolutionManagement.repositories)
+              route(settings.pluginManagement.repositories)
+              route(settings.dependencyResolutionManagement.repositories)
           }
 
           allprojects { project ->
-              balance(project.buildscript.repositories)
-              balance(project.repositories)
+              route(project.buildscript.repositories)
+              route(project.repositories)
           }
+
+          println "[ci] Maven Central and the Gradle Plugin Portal are served by ${MIRRORS}"
           GRADLE
           echo "Installed Gradle init script at $HOME/.gradle/init.d/ci-repositories.gradle"
 
