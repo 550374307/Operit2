@@ -1,0 +1,297 @@
+name: Android Build (Linux Host)
+
+# Builds the Android APK on a Linux runner.
+#
+# The upstream `android-flutter-build.yml` builds the APK on windows-2025.
+# That cannot work for source-built V8: the `v8` crate's build script runs
+# `gn gen`, and Chromium's //build/config/BUILDCONFIG.gn asserts
+#   assert(host_os == "linux", "Android builds are only supported on Linux.")
+# so :app:prepareOperitAndroidV8arm64v8a panics with
+#   Android V8 preparation failed: ... returned non-zero exit status 101
+# on any non-Linux host. See docs in tools/build_scripts/prepare_android_v8.py,
+# which itself only supports HOST_TAG == linux-x86_64 for the NDK fallback.
+#
+# This workflow reuses the same runtime job as upstream and only moves the APK
+# job to ubuntu-24.04.
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_module:
+        description: "Also build the Android module package"
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  build-android-runtime:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Android runtime build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            bison \
+            build-essential \
+            bzip2 \
+            ca-certificates \
+            curl \
+            diffutils \
+            flex \
+            gawk \
+            gzip \
+            patch \
+            pkg-config \
+            tar \
+            unzip \
+            xz-utils
+
+      - name: Fetch Android runtime sources
+        shell: pwsh
+        run: pwsh -NoProfile -File tools/android-runtime/fetch_sources.ps1
+
+      - name: Fetch Android NDK
+        run: bash tools/android-runtime/fetch_ndk_wsl.sh
+
+      - name: Build Android terminal runtime
+        run: |
+          export ANDROID_NDK_HOME="$HOME/.cache/operit-android-runtime/android-ndk-r29-beta4"
+          bash tools/android-runtime/build_android_tools_wsl.sh
+          bash tools/android-runtime/build_alpine_rootfs_wsl.sh
+
+      - name: Upload Android terminal runtime
+        uses: actions/upload-artifact@v4
+        with:
+          name: operit2-android-runtime-${{ github.sha }}
+          path: |
+            apps/flutter/app/android/app/src/main/jniLibs/arm64-v8a/libbash.so
+            apps/flutter/app/android/app/src/main/jniLibs/arm64-v8a/liboperit_busybox.so
+            apps/flutter/app/android/app/src/main/jniLibs/arm64-v8a/liboperit_loader.so
+            apps/flutter/app/android/app/src/main/jniLibs/arm64-v8a/liboperit_proot.so
+            apps/flutter/app/android/app/src/main/assets/android-runtime/arm64-v8a/rootfs.tar.gz.bin
+            apps/flutter/app/android/app/src/main/assets/android-runtime/arm64-v8a/rootfs.tar.gz.bin.sha256
+          if-no-files-found: error
+          retention-days: 1
+
+  build-android:
+    needs: build-android-runtime
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    env:
+      RUSTFLAGS: -Awarnings
+      RUST_TOOLCHAIN_VERSION: 1.95.0
+      FVM_VERSION: 4.3.0
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download Android terminal runtime
+        uses: actions/download-artifact@v4
+        with:
+          name: operit2-android-runtime-${{ github.sha }}
+          path: apps/flutter/app/android/app/src/main
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            clang \
+            cmake \
+            curl \
+            file \
+            git \
+            libc6-dev \
+            libssl-dev \
+            lld \
+            ninja-build \
+            pkg-config \
+            python3-full \
+            python3-venv \
+            unzip \
+            xz-utils
+
+      - name: Install bootstrap Dart
+        uses: dart-lang/setup-dart@v1
+        with:
+          sdk: 3.11.5
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Install Emscripten
+        uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: 4.0.10
+          actions-cache-folder: emsdk-cache-linux
+
+      - name: Install plugin build tools
+        run: |
+          npm install --prefix .ci-tools/typescript --no-audit --no-fund typescript@5.9.3
+          corepack enable
+
+      - name: Install Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install FVM
+        run: |
+          dart pub global activate fvm "$FVM_VERSION"
+          echo "$HOME/.pub-cache/bin" >> "$GITHUB_PATH"
+
+      - name: Install project Flutter SDK
+        working-directory: apps/flutter/app
+        run: fvm install --skip-pub-get
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN_VERSION }}
+          targets: aarch64-linux-android
+
+      - name: Install Android NDK for V8 source build
+        run: |
+          # rusty_v8 needs an NDK r23+; reuse the one the runtime job cached so
+          # the APK job does not download it a second time.
+          ndk_root="$HOME/.cache/operit-android-runtime/android-ndk-r29-beta4"
+          if [ ! -d "$ndk_root" ]; then
+            bash tools/android-runtime/fetch_ndk_wsl.sh
+          fi
+          echo "OPERIT_ANDROID_V8_NDK=$ndk_root" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$ndk_root" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=$ndk_root" >> "$GITHUB_ENV"
+
+      - name: Install libclang 21 for bindgen
+        run: |
+          # prepare_android_v8.py's Linux branch scans /usr/lib/llvm*/lib for
+          # libclang.so.21+. Ubuntu 24.04 ships llvm-18, so pull llvm-21 from
+          # apt.llvm.org. If that repository is unreachable, fall back to a
+          # versioned check that fails loudly rather than breaking later.
+          set -euo pipefail
+          sudo apt-get install -y wget gnupg software-properties-common
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key \
+            | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc > /dev/null
+          codename="$(. /etc/os-release && echo "$VERSION_CODENAME")"
+          echo "deb http://apt.llvm.org/${codename}/ llvm-toolchain-${codename}-21 main" \
+            | sudo tee /etc/apt/sources.list.d/llvm21.list > /dev/null
+          sudo apt-get update
+          sudo apt-get install -y libclang-21-dev llvm-21 lld-21 libc++-21-dev libc++abi-21-dev
+          if ! ls /usr/lib/llvm-21/lib/libclang.so* > /dev/null 2>&1; then
+            ls -d /usr/lib/llvm-*/lib 2>/dev/null || true
+            echo "libclang 21 was not installed where prepare_android_v8.py looks" >&2
+            exit 1
+          fi
+          echo "OPERIT_ANDROID_V8_LLVM=/usr/lib/llvm-21" >> "$GITHUB_ENV"
+
+      - name: Restore Android signing material
+        env:
+          ANDROID_RELEASE_KEYSTORE_BASE64: ${{ secrets.ANDROID_RELEASE_KEYSTORE_BASE64 }}
+          ANDROID_RELEASE_STORE_PASSWORD: ${{ secrets.ANDROID_RELEASE_STORE_PASSWORD }}
+          ANDROID_RELEASE_KEY_ALIAS: ${{ secrets.ANDROID_RELEASE_KEY_ALIAS }}
+          ANDROID_RELEASE_KEY_PASSWORD: ${{ secrets.ANDROID_RELEASE_KEY_PASSWORD }}
+        run: |
+          if [[ -z "${ANDROID_RELEASE_KEYSTORE_BASE64:-}" \
+             || -z "${ANDROID_RELEASE_STORE_PASSWORD:-}" \
+             || -z "${ANDROID_RELEASE_KEY_ALIAS:-}" \
+             || -z "${ANDROID_RELEASE_KEY_PASSWORD:-}" ]]; then
+            echo "::warning::Android signing secrets are incomplete; falling back to unsigned release signing."
+            echo "OPERIT_ANDROID_DEBUG_SIGNING=true" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          secrets_dir="tools/release/secrets"
+          mkdir -p "$secrets_dir"
+          printf '%s' "$ANDROID_RELEASE_KEYSTORE_BASE64" | base64 -d \
+            > "$secrets_dir/operit2-release.keystore"
+          {
+            echo "RELEASE_STORE_FILE=operit2-release.keystore"
+            echo "RELEASE_STORE_PASSWORD=$ANDROID_RELEASE_STORE_PASSWORD"
+            echo "RELEASE_KEY_ALIAS=$ANDROID_RELEASE_KEY_ALIAS"
+            echo "RELEASE_KEY_PASSWORD=$ANDROID_RELEASE_KEY_PASSWORD"
+          } > "$secrets_dir/android-signing.properties"
+          echo "Release keystore restored for signing."
+
+      - name: Cache source-built Android V8
+        uses: actions/cache@v4
+        with:
+          path: tools/release/work/android-v8
+          key: ${{ runner.os }}-${{ runner.arch }}-android-v8-${{ hashFiles('tools/build_scripts/prepare_android_v8.py', 'apps/flutter/native/operit-flutter-bridge/Cargo.lock') }}
+
+      - name: Build and package Android app
+        run: |
+          set -euo pipefail
+          version_line="$(grep -cE '^version:[[:space:]]*[0-9]+\.[0-9]+\.[0-9]+\+[0-9]+[[:space:]]*$' \
+            apps/flutter/app/pubspec.yaml || true)"
+          if [[ "$version_line" != "1" ]]; then
+            echo "apps/flutter/app/pubspec.yaml must contain exactly one release version line" >&2
+            exit 1
+          fi
+          build_name="$(sed -nE 's/^version:[[:space:]]*([0-9]+\.[0-9]+\.[0-9]+)\+[0-9]+[[:space:]]*$/\1/p' \
+            apps/flutter/app/pubspec.yaml)"
+          build_number="$(sed -nE 's/^version:[[:space:]]*[0-9]+\.[0-9]+\.[0-9]+\+([0-9]+)[[:space:]]*$/\1/p' \
+            apps/flutter/app/pubspec.yaml)"
+          # Bash drops unset variables instead of passing an empty argument, so
+          # this conditional flag cannot reproduce the PowerShell bug fixed in
+          # android-flutter-build.yml (commit 2efe2a1).
+          signing_args=()
+          if [[ "${OPERIT_ANDROID_DEBUG_SIGNING:-}" == "true" ]]; then
+            signing_args=(--skip-signing)
+          fi
+          python3 tools/build_scripts/build_flutter_android.py \
+            --build-name "$build_name" \
+            --build-number "$build_number" \
+            --enforce-lockfile \
+            "${signing_args[@]}"
+
+      - name: Build and package Android module
+        if: inputs.build_module
+        run: python3 tools/build_scripts/build_android_module_release.py --enforce-lockfile
+
+      - name: Verify APK signature
+        run: |
+          apk="$(ls tools/release/dist/operit2-app-android-arm64-v8a-*.apk | head -n 1)"
+          echo "APK: $apk"
+          apk_analyzer="$(find "$ANDROID_SDK_ROOT/build-tools" -name apksigner -type f 2>/dev/null | sort | tail -n 1)"
+          if [[ -n "$apk_analyzer" ]]; then
+            "$apk_analyzer" verify --print-certs "$apk"
+          else
+            echo "apksigner not found; skipping signature verification"
+          fi
+
+      - name: Upload Android artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: operit2-android-${{ github.sha }}
+          path: tools/release/dist/operit2-app-android-arm64-v8a-*.apk
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload Android module artifact
+        if: inputs.build_module
+        uses: actions/upload-artifact@v4
+        with:
+          name: operit2-android-module-${{ github.sha }}
+          path: tools/release/dist/operit2-module-android-arm64-v8a-*.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
