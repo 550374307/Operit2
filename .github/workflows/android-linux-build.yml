@@ -184,10 +184,17 @@ jobs:
 
       - name: Install libclang 21 for bindgen
         run: |
-          # prepare_android_v8.py's Linux branch scans /usr/lib/llvm*/lib for
-          # libclang.so.21+. Ubuntu 24.04 ships llvm-18, so pull llvm-21 from
-          # apt.llvm.org. If that repository is unreachable, fall back to a
-          # versioned check that fails loudly rather than breaking later.
+          # prepare_android_v8.py's find_libclang() scans /usr/lib/llvm*/lib for
+          # libclang.so.21+ on Linux. Ubuntu 24.04 ships llvm-18, so pull
+          # libclang-21 from apt.llvm.org.
+          #
+          # Do NOT set OPERIT_ANDROID_V8_LLVM here: that variable overrides the
+          # host toolchain in find_host_clang() and must point at an LLVM root
+          # containing bin/clang. Leaving it unset is the intended Linux
+          # behaviour -- GN then downloads Chromium's hermetic clang, which is
+          # what provides libclang_rt.builtins.a in the layout Chromium's
+          # toolchains expect. Only libclang (bindgen's parser library) needs
+          # to come from apt.
           set -euo pipefail
           sudo apt-get install -y wget gnupg software-properties-common
           wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key \
@@ -196,13 +203,16 @@ jobs:
           echo "deb http://apt.llvm.org/${codename}/ llvm-toolchain-${codename}-21 main" \
             | sudo tee /etc/apt/sources.list.d/llvm21.list > /dev/null
           sudo apt-get update
-          sudo apt-get install -y libclang-21-dev llvm-21 lld-21 libc++-21-dev libc++abi-21-dev
-          if ! ls /usr/lib/llvm-21/lib/libclang.so* > /dev/null 2>&1; then
+          sudo apt-get install -y libclang-21-dev libclang-common-21-dev llvm-21
+          libclang_dir="$(ls -d /usr/lib/llvm-21/lib 2>/dev/null || true)"
+          if [[ -z "$libclang_dir" ]] || ! ls "$libclang_dir"/libclang.so* > /dev/null 2>&1; then
+            echo "installed llvm layouts:" >&2
             ls -d /usr/lib/llvm-*/lib 2>/dev/null || true
             echo "libclang 21 was not installed where prepare_android_v8.py looks" >&2
             exit 1
           fi
-          echo "OPERIT_ANDROID_V8_LLVM=/usr/lib/llvm-21" >> "$GITHUB_ENV"
+          echo "Using libclang from $libclang_dir"
+          ls -1 "$libclang_dir"/libclang.so* 
 
       - name: Restore Android signing material
         env:
@@ -236,6 +246,45 @@ jobs:
         with:
           path: tools/release/work/android-v8
           key: ${{ runner.os }}-${{ runner.arch }}-android-v8-${{ hashFiles('tools/build_scripts/prepare_android_v8.py', 'apps/flutter/native/operit-flutter-bridge/Cargo.lock') }}
+
+      - name: Prefer upstream Maven repositories on CI
+        run: |
+          # apps/flutter/app/android/*.gradle.kts lists maven.aliyun.com mirrors
+          # ahead of google()/mavenCentral(). Those mirrors intermittently answer
+          # 502, and Gradle treats a 5xx as fatal for the requested module
+          # instead of falling through to the next repository, which failed the
+          # build with:
+          #   Could not resolve org.jetbrains.kotlin:kotlin-util-klib:1.9.25
+          #     > Received status code 502 from server: Bad Gateway
+          # A Gradle init script reorders the repositories for this CI run only,
+          # so the repository sources stay untouched for local development.
+          mkdir -p "$HOME/.gradle/init.d"
+          cat > "$HOME/.gradle/init.d/ci-repositories.gradle" <<'GRADLE'
+          // Put the canonical repositories first and keep the regional mirrors as
+          // a fallback, so a 5xx from one host does not abort dependency resolution.
+          def preferUpstream = { RepositoryHandler repositories ->
+              def upstream = repositories.findAll {
+                  it instanceof MavenArtifactRepository &&
+                      (it.url.toString().contains('dl.google.com') ||
+                       it.url.toString().contains('repo.maven.apache.org') ||
+                       it.url.toString().contains('plugins.gradle.org') ||
+                       it.url.toString().contains('jitpack.io'))
+              }
+              repositories.removeAll(upstream)
+              upstream.each { repositories.addFirst(it) }
+          }
+
+          beforeSettings { settings ->
+              preferUpstream(settings.pluginManagement.repositories)
+              preferUpstream(settings.dependencyResolutionManagement.repositories)
+          }
+
+          allprojects { project ->
+              preferUpstream(project.buildscript.repositories)
+              preferUpstream(project.repositories)
+          }
+          GRADLE
+          echo "Installed Gradle init script at $HOME/.gradle/init.d/ci-repositories.gradle"
 
       - name: Build and package Android app
         run: |
