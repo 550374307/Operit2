@@ -344,20 +344,47 @@ jobs:
           }
 
           def route = { RepositoryHandler repositories ->
-              def removed = repositories.findAll { isThrottled(it) || isMirror(it) }
-              repositories.removeAll(removed)
-              // Re-insert the mirrors at the front, in priority order, so Maven
-              // Central artifacts resolve without touching a throttled host.
-              // `repositories.maven {}` defaults to the name "maven", so adding
-              // two of them throws 'Cannot add a repository with name maven as a
-              // repository with that name already exists'; name each one.
-              MIRRORS.reverseEach { target ->
-                  if (!repositories.findByName(target.name)) {
-                      repositories.addFirst(
-                              repositories.maven {
-                                  name = target.name
-                                  url = target.url
-                              })
+              // Repoint repositories that Gradle would otherwise send to a
+              // throttled host. Adding new entries is fragile:
+              // RepositoryHandler is a NamedDomainObjectContainer whose name
+              // index is not refreshed between inserts, so a second insert
+              // throws
+              //   Cannot add a repository with name 'ci-aliyun-public' as a
+              //   repository with that name already exists.
+              //
+              // Instead: rewrite the URL in place, then drop any repository that
+              // ends up duplicating an earlier URL, so each mirror is listed
+              // once and the repository count never grows. Safe to call from
+              // pluginManagement, buildscript and project scopes.
+              repositories.withType(MavenArtifactRepository).configureEach { repo ->
+                  def url = repo.url.toString()
+                  if (!THROTTLED_PREFIXES.any { url.contains(it) }) return
+                  // plugins.gradle.org serves plugin markers, Maven Central
+                  // serves libraries; pick the mirror by what the host carried.
+                  def target = url.contains('plugins.gradle.org')
+                          ? MIRRORS[0]
+                          : MIRRORS[1]
+                  println "[ci] ${repo.name}: ${url} -> ${target.url}"
+                  repo.url = target.url
+              }
+
+              def seen = [] as Set
+              repositories.withType(MavenArtifactRepository).removeIf { repo ->
+                  def key = repo.url.toString()
+                  !seen.add(key)
+              }
+
+              // Ensure both mirrors are present even when the project listed
+              // neither; this is the only case where anything is added.
+              MIRRORS.each { target ->
+                  def present = repositories.withType(MavenArtifactRepository).any {
+                      it.url.toString().startsWith(target.url)
+                  }
+                  if (!present) {
+                      repositories.maven {
+                          name = target.name
+                          url = target.url
+                      }
                   }
               }
           }
