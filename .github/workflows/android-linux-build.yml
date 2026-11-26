@@ -254,8 +254,47 @@ jobs:
             echo "libclang 21 was not installed where prepare_android_v8.py looks" >&2
             exit 1
           fi
+          # find_libclang() only accepts a name matching libclang\.so\.(\d+) with
+          # a major version of 21 or newer:
+          #   match = re.search(r"libclang\.so\.(\d+)", library.name)
+          # libclang-21-dev ships a bare libclang.so symlink, which the pattern
+          # does not match, so it is skipped and the build dies with
+          #   V8 source bindings require LLVM/libclang 21.1 or newer
+          # Add the versioned names the scanner expects.
+          for name in libclang.so libclang-21.so.1; do
+            if [[ -e "$libclang_dir/$name" ]]; then
+              sudo ln -sfn "$libclang_dir/$name" "$libclang_dir/libclang.so.21"
+              break
+            fi
+          done
+          if [[ ! -e "$libclang_dir/libclang.so.21" ]]; then
+            echo "could not expose libclang.so.21 in $libclang_dir" >&2
+            ls -1 "$libclang_dir"/libclang* >&2
+            exit 1
+          fi
           echo "Using libclang from $libclang_dir"
-          ls -1 "$libclang_dir"/libclang.so* 
+          ls -1 "$libclang_dir"/libclang*
+
+      - name: Verify libclang version detection
+        run: |
+          # Fail fast instead of discovering this 25 minutes into the build.
+          # This runs the exact function prepare_android_v8.py uses, so a naming
+          # or version mismatch surfaces here rather than inside Gradle.
+          set -euo pipefail
+          python3 - <<'PY'
+          import sys
+          from pathlib import Path
+          sys.path.insert(0, "tools/build_scripts")
+          import prepare_android_v8 as v8
+
+          directory = v8.find_libclang()
+          print(f"find_libclang() -> {directory}")
+          libraries = sorted(Path(directory).glob("libclang.so*"))
+          if not libraries:
+              raise SystemExit(f"no libclang.so* under {directory}")
+          for library in libraries:
+              print(f"  {library.name}")
+          PY
 
       - name: Restore Android signing material
         env:
