@@ -60,7 +60,16 @@ jobs:
         run: |
           npm install --prefix .ci-tools/typescript --no-audit --no-fund typescript@5.9.3
           corepack enable
-
+          # emsdk's wasm-ld lives under upstream/bin; expose it for wasm plugins.
+          $emsdkBin = Get-ChildItem -Path "${{ github.workspace }}" -Recurse -Filter "wasm-ld.exe" -ErrorAction SilentlyContinue |
+            Select-Object -First 1 -ExpandProperty FullName
+          if ($emsdkBin) {
+            $emsdkDir = Split-Path -Parent $emsdkBin
+            $emsdkDir | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+            Write-Host "Added wasm-ld directory to PATH: $emsdkDir"
+          } else {
+            Write-Warning "wasm-ld.exe not found after emsdk setup"
+          }
       - name: Install FVM
         shell: pwsh
         run: |
@@ -81,6 +90,11 @@ jobs:
       - name: Install LLVM
         shell: pwsh
         run: choco install llvm --no-progress --limit-output --yes
+
+      - name: Cargo check operit-flutter-bridge (surface real rustc errors)
+        working-directory: apps/flutter/native/operit-flutter-bridge
+        shell: pwsh
+        run: cargo check --locked 2>&1 | Tee-Object -FilePath cargo-check.log; if ($LASTEXITCODE -ne 0) { Get-Content cargo-check.log | Select-String -Pattern "error" | Select-Object -First 40 | ForEach-Object { $_.Line }; exit 1 }
 
       - name: Install .NET SDK for MSI packaging
         if: inputs.products != 'cli'

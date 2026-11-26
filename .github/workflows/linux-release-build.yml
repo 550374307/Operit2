@@ -65,7 +65,8 @@ jobs:
             dbus-x11 \
             xvfb \
             openbox \
-            xcompmgr
+            xcompmgr \
+            lld
 
       - name: Check native Linux window automation
         run: |

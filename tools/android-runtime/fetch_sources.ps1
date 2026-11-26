@@ -32,6 +32,11 @@ $items = @(
     @{
         Name = "bash-5.2.37"
         Url = "https://ftp.gnu.org/gnu/bash/bash-5.2.37.tar.gz"
+        MirrorUrls = @(
+            "https://mirrors.tuna.tsinghua.edu.cn/gnu/bash/bash-5.2.37.tar.gz",
+            "https://mirror.csclub.uwaterloo.ca/gnu/bash/bash-5.2.37.tar.gz",
+            "https://mirrors.kernel.org/gnu/bash/bash-5.2.37.tar.gz"
+        )
         Archive = "bash-5.2.37.tar.gz"
         Sha256 = "9599B22ECD1D5787AD7D3B7BF0C59F312B3396D1E281175DD1F8A4014DA621FF"
         Extracted = "bash-5.2.37"
@@ -43,14 +48,17 @@ foreach ($item in $items) {
     Write-Host "Downloading $($item.Name)"
 
     $maxAttempts = 5
+    $candidateUrls = @($item.Url) + @($item.MirrorUrls)
     $downloaded = $false
     for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+        $url = $candidateUrls[($attempt - 1) % $candidateUrls.Count]
         try {
-            Invoke-WebRequest -Uri $item.Url -OutFile $archivePath -TimeoutSec 600
+            Write-Host "Downloading $($item.Name) from $url"
+            Invoke-WebRequest -Uri $url -OutFile $archivePath -TimeoutSec 600
             $downloaded = $true
             break
         } catch {
-            Write-Warning "Attempt $attempt/$maxAttempts failed for $($item.Name): $($_.Exception.Message)"
+            Write-Warning "Attempt $attempt/$maxAttempts failed for $($item.Name) ($url): $($_.Exception.Message)"
             if ($attempt -lt $maxAttempts) {
                 Start-Sleep -Seconds (10 * $attempt)
             } else {
