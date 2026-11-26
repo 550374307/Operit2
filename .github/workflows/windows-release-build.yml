@@ -49,6 +49,12 @@ jobs:
         with:
           node-version: 24
 
+      - name: Install plugin build tools
+        shell: pwsh
+        run: |
+          npm install --prefix .ci-tools/typescript --no-audit --no-fund typescript@5.9.3
+          corepack enable
+
       - name: Install FVM
         shell: pwsh
         run: |

@@ -41,7 +41,24 @@ $items = @(
 foreach ($item in $items) {
     $archivePath = Join-Path $downloadsDir $item.Archive
     Write-Host "Downloading $($item.Name)"
-    Invoke-WebRequest -Uri $item.Url -OutFile $archivePath
+
+    $maxAttempts = 5
+    $downloaded = $false
+    for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+        try {
+            Invoke-WebRequest -Uri $item.Url -OutFile $archivePath -TimeoutSec 600
+            $downloaded = $true
+            break
+        } catch {
+            Write-Warning "Attempt $attempt/$maxAttempts failed for $($item.Name): $($_.Exception.Message)"
+            if ($attempt -lt $maxAttempts) {
+                Start-Sleep -Seconds (10 * $attempt)
+            } else {
+                throw
+            }
+        }
+    }
+    if (-not $downloaded) { throw "Failed to download $($item.Name) after $maxAttempts attempts." }
 
     $actualSha256 = (Get-FileHash -Algorithm SHA256 -Path $archivePath).Hash.ToUpperInvariant()
     if ($actualSha256 -ne $item.Sha256) {

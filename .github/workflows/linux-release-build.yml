@@ -82,6 +82,11 @@ jobs:
         with:
           node-version: 24
 
+      - name: Install plugin build tools
+        run: |
+          npm install --prefix .ci-tools/typescript --no-audit --no-fund typescript@5.9.3
+          corepack enable
+
       - name: Install FVM
         run: |
           dart pub global activate fvm "$FVM_VERSION"
