@@ -82,6 +82,12 @@ jobs:
         with:
           node-version: 24
 
+      - name: Install Emscripten
+        uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: 4.0.10
+          actions-cache-folder: emsdk-cache-linux
+
       - name: Install plugin build tools
         run: |
           npm install --prefix .ci-tools/typescript --no-audit --no-fund typescript@5.9.3

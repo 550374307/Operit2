@@ -94,6 +94,18 @@ jobs:
         with:
           node-version: 24
 
+      - name: Install Emscripten
+        uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: 4.0.10
+          actions-cache-folder: emsdk-cache-android
+
+      - name: Install plugin build tools
+        shell: pwsh
+        run: |
+          npm install --prefix .ci-tools/typescript --no-audit --no-fund typescript@5.9.3
+          corepack enable
+
       - name: Install Java
         uses: actions/setup-java@v4
         with:
@@ -149,7 +161,9 @@ jobs:
           )
           $missing = $required | Where-Object { [string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($_)) }
           if ($missing.Count -gt 0) {
-            throw "Missing required GitHub Actions secrets: $($missing -join ', ')"
+            Write-Warning "Missing GitHub Actions secrets: $($missing -join ', '). Falling back to debug signing (unsigned-release APK)."
+            "OPERIT_ANDROID_DEBUG_SIGNING=true" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+            exit 0
           }
           $secretsDir = "tools/release/secrets"
           New-Item -ItemType Directory -Force -Path $secretsDir | Out-Null
@@ -175,7 +189,11 @@ jobs:
           if ($version.Count -ne 1) {
             throw "apps/flutter/app/pubspec.yaml must contain exactly one release version line"
           }
-          python tools/build_scripts/build_flutter_android.py --build-name $version[0].Groups[1].Value --build-number $version[0].Groups[2].Value --enforce-lockfile
+          $signingArgs = ""
+          if ($env:OPERIT_ANDROID_DEBUG_SIGNING -eq "true") {
+            $signingArgs = "--skip-signing"
+          }
+          python tools/build_scripts/build_flutter_android.py --build-name $version[0].Groups[1].Value --build-number $version[0].Groups[2].Value --enforce-lockfile $signingArgs
 
       - name: Build and package Android module
         shell: pwsh
