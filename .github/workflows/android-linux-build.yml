@@ -207,36 +207,6 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-pub-cache-
 
-      - name: Pre-fetch gitee git dependency
-        run: |
-          # pubspec.yaml resolves path_provider_ohos and url_launcher_ohos from
-          # https://gitee.com/openharmony-sig/flutter_packages.git at a pinned
-          # ref. They are OpenHarmony-only, but `pub get` still clones them, and
-          # GitHub's US-hosted runners frequently lose the TLS session:
-          #   error: RPC failed; curl 56 GnuTLS recv error (-110)
-          #   fatal: early EOF
-          # Retry the clone here so a single dropped packet does not abort the
-          # whole dependency resolution. pub then reuses the populated
-          # ~/.pub-cache/git directory via the cache step above.
-          url="https://gitee.com/openharmony-sig/flutter_packages.git"
-          if ! git ls-remote "$url" > /dev/null 2>&1; then
-            echo "::warning::gitee.com is unreachable from this runner; relying on pub-cache."
-            exit 0
-          fi
-          work="$(mktemp -d)"
-          for attempt in 1 2 3 4 5; do
-            if git clone --bare --filter=blob:none "$url" "$work/repo.git"; then
-              echo "gitee dependency fetched on attempt $attempt."
-              rm -rf "$work"
-              exit 0
-            fi
-            echo "::warning::gitee clone attempt $attempt failed; retrying in 20s."
-            rm -rf "$work" && mkdir -p "$work"
-            sleep 20
-          done
-          rm -rf "$work"
-          echo "::warning::could not pre-fetch gitee; letting pub get try on its own."
-
       - name: Install Rust
         uses: dtolnay/rust-toolchain@master
         with:

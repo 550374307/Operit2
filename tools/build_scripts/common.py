@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import time
 from pathlib import Path
 
 from release_artifacts import release_asset_name
@@ -360,11 +361,39 @@ def dart_pub_get(enforce_lockfile: bool = False, env: dict[str, str] | None = No
 
 
 def flutter_pub_get(enforce_lockfile: bool = False, env: dict[str, str] | None = None) -> None:
-    """Resolves app dependencies and generates native plugin registrants with FVM Flutter."""
+    """Resolves app dependencies and generates native plugin registrants with FVM Flutter.
+
+    Retries transient git failures. pubspec.yaml pulls path_provider_ohos and
+    url_launcher_ohos from gitee.com, and a single dropped TLS packet aborts the
+    entire resolution with "GnuTLS recv error (-110) / fatal: early EOF".
+    Retrying whole `pub get` runs is the only lever available: pub clones git
+    dependencies into its own ~/.pub-cache/_temp and offers no per-fetch retry.
+    """
     command = [require_command("fvm"), "flutter", "pub", "get"]
     if enforce_lockfile:
         command.append("--enforce-lockfile")
-    run(command, cwd=FLUTTER_APP_DIR, env=env)
+
+    # A retry only helps if the half-written clone is gone first.
+    pub_cache = env.get("PUB_CACHE") if env else os.environ.get("PUB_CACHE")
+    temp_dir = (Path(pub_cache).expanduser() / "_temp") if pub_cache else (
+        Path.home() / ".pub-cache" / "_temp")
+
+    attempts = int(os.environ.get("OPERIT_PUB_GET_ATTEMPTS", "4"))
+    attempts = max(1, attempts)
+    for attempt in range(1, attempts + 1):
+        try:
+            run(command, cwd=FLUTTER_APP_DIR, env=env)
+            return
+        except RuntimeError:
+            if attempt >= attempts:
+                raise
+            print(
+                f"flutter pub get failed (attempt {attempt}/{attempts}); "
+                "clearing the pub git scratch directory and retrying",
+                file=sys.stderr, flush=True,
+            )
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            time.sleep(15 * attempt)
 
 
 def build_env_with_typescript(version: str) -> dict[str, str]:
