@@ -189,11 +189,11 @@ jobs:
           if ($version.Count -ne 1) {
             throw "apps/flutter/app/pubspec.yaml must contain exactly one release version line"
           }
-          $signingArgs = ""
+          $signingArgs = @()
           if ($env:OPERIT_ANDROID_DEBUG_SIGNING -eq "true") {
-            $signingArgs = "--skip-signing"
+            $signingArgs = @("--skip-signing")
           }
-          python tools/build_scripts/build_flutter_android.py --build-name $version[0].Groups[1].Value --build-number $version[0].Groups[2].Value --enforce-lockfile $signingArgs
+          python tools/build_scripts/build_flutter_android.py --build-name $version[0].Groups[1].Value --build-number $version[0].Groups[2].Value --enforce-lockfile @signingArgs
 
       - name: Build and package Android module
         shell: pwsh
