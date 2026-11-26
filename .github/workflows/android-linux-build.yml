@@ -290,41 +290,67 @@ jobs:
           path: tools/release/work/android-v8
           key: ${{ runner.os }}-${{ runner.arch }}-android-v8-${{ hashFiles('tools/build_scripts/prepare_android_v8.py', 'apps/flutter/native/operit-flutter-bridge/Cargo.lock') }}
 
-      - name: Prefer upstream Maven repositories on CI
+      - name: Cache Gradle dependencies
+        uses: actions/cache@v4
+        with:
+          # repo.maven.apache.org throttles GitHub's shared runner IPs with 429,
+          # so keep the resolved artifacts between runs and cut the number of
+          # network hits on a cold Gradle Home.
+          path: |
+            ~/.gradle/caches/modules-2
+            ~/.gradle/caches/jars-9
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('apps/flutter/app/android/**/*.gradle*', 'apps/flutter/app/android/gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+
+      - name: Balance Maven repositories on CI
         run: |
           # apps/flutter/app/android/*.gradle.kts lists maven.aliyun.com mirrors
-          # ahead of google()/mavenCentral(). Those mirrors intermittently answer
-          # 502, and Gradle treats a 5xx as fatal for the requested module
-          # instead of falling through to the next repository, which failed the
-          # build with:
-          #   Could not resolve org.jetbrains.kotlin:kotlin-util-klib:1.9.25
-          #     > Received status code 502 from server: Bad Gateway
-          # A Gradle init script reorders the repositories for this CI run only,
-          # so the repository sources stay untouched for local development.
+          # ahead of google()/mavenCentral(). Two failure modes have been seen:
+          #
+          #   aliyun first  -> 502 Bad Gateway on kotlin-util-klib
+          #   upstream first -> 429 Too Many Requests on repo.maven.apache.org
+          #
+          # Gradle treats 4xx/5xx on a repository as fatal for that module and
+          # does not fall through, so whichever host comes first decides the
+          # build. A CI-only init script interleaves the two sets instead: the
+          # canonical repositories are tried first, and the regional mirror is
+          # retained as the next entry so a throttled Maven Central still has a
+          # working fallback. Project build files stay untouched for local use.
           mkdir -p "$HOME/.gradle/init.d"
           cat > "$HOME/.gradle/init.d/ci-repositories.gradle" <<'GRADLE'
-          // Put the canonical repositories first and keep the regional mirrors as
-          // a fallback, so a 5xx from one host does not abort dependency resolution.
-          def preferUpstream = { RepositoryHandler repositories ->
-              def upstream = repositories.findAll {
-                  it instanceof MavenArtifactRepository &&
-                      (it.url.toString().contains('dl.google.com') ||
-                       it.url.toString().contains('repo.maven.apache.org') ||
-                       it.url.toString().contains('plugins.gradle.org') ||
-                       it.url.toString().contains('jitpack.io'))
+          // Interleave: upstream first, mirror immediately after, so a 429 from
+          // Maven Central or a 502 from the mirror still leaves a working path.
+          def balance = { RepositoryHandler repositories ->
+              def isUpstream = { repo ->
+                  if (!(repo instanceof MavenArtifactRepository)) return false
+                  def url = repo.url.toString()
+                  url.contains('dl.google.com') ||
+                      url.contains('repo.maven.apache.org') ||
+                      url.contains('plugins.gradle.org') ||
+                      url.contains('jitpack.io')
               }
-              repositories.removeAll(upstream)
-              upstream.each { repositories.addFirst(it) }
+              def all = repositories.toList()
+              def upstream = all.findAll(isUpstream)
+              def mirrors = all.findAll { !isUpstream(it) }
+              if (upstream.isEmpty() || mirrors.isEmpty()) return
+              repositories.clear()
+              def max = Math.max(upstream.size(), mirrors.size())
+              for (int i = 0; i < max; i++) {
+                  if (i < upstream.size()) repositories.add(upstream[i])
+                  if (i < mirrors.size()) repositories.add(mirrors[i])
+              }
           }
 
           beforeSettings { settings ->
-              preferUpstream(settings.pluginManagement.repositories)
-              preferUpstream(settings.dependencyResolutionManagement.repositories)
+              balance(settings.pluginManagement.repositories)
+              balance(settings.dependencyResolutionManagement.repositories)
           }
 
           allprojects { project ->
-              preferUpstream(project.buildscript.repositories)
-              preferUpstream(project.repositories)
+              balance(project.buildscript.repositories)
+              balance(project.repositories)
           }
           GRADLE
           echo "Installed Gradle init script at $HOME/.gradle/init.d/ci-repositories.gradle"
